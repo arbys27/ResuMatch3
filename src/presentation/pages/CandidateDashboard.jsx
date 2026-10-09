@@ -1,8 +1,11 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { logoutUser, getCurrentUser, updateUserMetadata } from "../../data/services/authService";
+import { logoutUser, getCurrentUser, updateUserMetadata, createPublicProfile } from "../../data/services/authService";
 import { TopHeader } from "../components/TopHeader";
-import { FilterModal } from "../components/FilterModal";
+// File on disk is "FIlterModal.jsx" (capital I). The import must match exactly or the Linux build on Railway fails.
+import { FilterModal } from "../components/FIlterModal";
+import { ApplicationsModal } from "../components/ApplicationsModal";
+import { CompanyViewModal } from "../components/CompanyViewModal";
 import { ProfileModal } from "../components/ProfileModal";
 import { supabase } from "../../../supabaseClient.js";
 
@@ -17,43 +20,64 @@ const hasProfileValue = (value) => {
 const profileCompletion = (profile) => profile ? Math.round((profileFields.filter((field) => hasProfileValue(profile[field])).length / profileFields.length) * 100) : 0;
 const jobText = (job) => [job.title, job.description, job.requirements, job.location, job.work_type, job.employment_type].filter(Boolean).join(" ").toLowerCase();
 
-function JobCard({ job, isSaved, onToggleSave, isDarkMode, userId }) {
+// A candidate can apply to a position once. If the recruiter marks the application
+// "Rejected" (shown as "Not selected"), they may re-apply after this many days,
+// counted from when the status was set. Keep in sync with reapply_to_job() in the SQL migration.
+export const REAPPLY_COOLDOWN_DAYS = 30;
+
+const formatDay = (d) => d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+
+const getApplyState = (application) => {
+  if (!application) return { kind: 'new' };
+  if (application.status === 'Rejected') {
+    const decidedAt = new Date(application.statusUpdatedAt || application.appliedAt);
+    const availableAt = new Date(decidedAt.getTime() + REAPPLY_COOLDOWN_DAYS * 24 * 60 * 60 * 1000);
+    return Date.now() >= availableAt.getTime() ? { kind: 'reapply' } : { kind: 'cooldown', availableAt };
+  }
+  return { kind: 'applied', status: application.status || 'Applied' };
+};
+
+const appliedLabel = (status) => ({ Interview: 'Applied · Interview stage', Hired: 'Hired' }[status] || 'Applied');
+
+function JobCard({ job, isSaved, onToggleSave, isDarkMode, userId, application, onApplied, onOpenCompany }) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [isApplying, setIsApplying] = useState(false);
-  const [applyStatus, setApplyStatus] = useState(null); 
+  const [justApplied, setJustApplied] = useState(false);
+  const [applyError, setApplyError] = useState('');
+
+  const applyState = justApplied && !application ? { kind: 'applied', status: 'Applied' } : getApplyState(application);
+  const canApply = applyState.kind === 'new' || applyState.kind === 'reapply';
 
   const handleApply = async (e) => {
     e.stopPropagation();
-    if (isApplying || applyStatus === 'success') return;
+    if (isApplying || !canApply) return;
 
     setIsApplying(true);
-    setApplyStatus(null);
+    setApplyError('');
 
     try {
-      const { error } = await supabase.from('applications').insert([{
-  candidate_id: userId,
-  job_id: job.id,
-  match_score: job.match || 0,
-  status: 'Applied'
-}]);
-
-      if (error) {
-        if (error.code === '23505') {
-          setApplyStatus('already_applied');
-        } else {
-          throw error;
-        }
+      if (applyState.kind === 'reapply') {
+        const { error } = await supabase.rpc('reapply_to_job', { p_job_id: job.id, p_match_score: job.match || 0 });
+        if (error) throw error;
       } else {
-        setApplyStatus('success');
+        const { error } = await supabase.from('applications').insert([{
+          candidate_id: userId,
+          job_id: job.id,
+          match_score: job.match || 0,
+          status: 'Applied'
+        }]);
+        // 23505 = already applied (unique candidate/job). Refresh so the card shows the existing application.
+        if (error && error.code !== '23505') throw error;
       }
+      setJustApplied(true);
+      await onApplied?.();
     } catch (err) {
       console.error("Application Error:", err);
-      setApplyStatus('error');
+      setApplyError(err.message || 'Failed to submit application.');
     } finally {
       setIsApplying(false);
     }
   };
-
 
   const keywords = ['Design systems', 'B2B SaaS', 'Figma', 'User research', 'Cross-functional leadership', 'A/B testing'];
 
@@ -78,6 +102,11 @@ function JobCard({ job, isSaved, onToggleSave, isDarkMode, userId }) {
 
           {!isExpanded && (
             <div className="flex gap-2 mt-2.5">
+              {applyState.kind !== 'new' && (
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${applyState.kind === 'reapply' ? 'bg-[#ea6036]/15 text-[#ea6036]' : (isDarkMode ? 'bg-[#4fa784]/15 text-[#4fa784]' : 'bg-emerald-50 text-emerald-700')}`}>
+                  {applyState.kind === 'applied' ? appliedLabel(applyState.status) : applyState.kind === 'reapply' ? 'Can re-apply' : 'Not selected'}
+                </span>
+              )}
               <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${isDarkMode ? 'bg-[#1a2636] text-slate-300' : 'bg-slate-100 text-slate-600'}`}>
                 {job.employment_type || 'Full-time'}
               </span>
@@ -128,16 +157,17 @@ function JobCard({ job, isSaved, onToggleSave, isDarkMode, userId }) {
             <div className="flex flex-wrap items-center gap-3 pt-2">
               <button
                 onClick={handleApply}
-                disabled={isApplying || applyStatus === 'success' || applyStatus === 'already_applied'}
-                className={`px-4 py-2 text-xs font-bold rounded-lg transition-all shadow-sm ${applyStatus === 'success' || applyStatus === 'already_applied'
+                disabled={isApplying || !canApply}
+                className={`px-4 py-2 text-xs font-bold rounded-lg transition-all shadow-sm ${!canApply
                     ? (isDarkMode ? 'bg-slate-800 text-slate-400 cursor-not-allowed' : 'bg-slate-200 text-slate-500 cursor-not-allowed')
-                    : 'bg-[#4fa784] hover:bg-[#3d8c6d] text-white'
+                    : applyState.kind === 'reapply' ? 'bg-[#ea6036] hover:bg-[#d8552e] text-white' : 'bg-[#4fa784] hover:bg-[#3d8c6d] text-white'
                   }`}
               >
                 {isApplying ? 'Applying...'
-                  : applyStatus === 'success' ? 'Applied Successfully'
-                    : applyStatus === 'already_applied' ? 'Already Applied'
-                      : 'One-click apply'}
+                  : applyState.kind === 'applied' ? appliedLabel(applyState.status)
+                    : applyState.kind === 'cooldown' ? `Re-apply from ${formatDay(applyState.availableAt)}`
+                      : applyState.kind === 'reapply' ? 'Re-apply'
+                        : 'One-click apply'}
               </button>
 
               <button
@@ -147,13 +177,17 @@ function JobCard({ job, isSaved, onToggleSave, isDarkMode, userId }) {
                 {isSaved ? 'Remove from saved' : 'Save for later'}
               </button>
 
-              <button className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors border flex items-center gap-1.5 ${isDarkMode ? 'border-white/10 text-slate-300 hover:bg-[#1a2636]' : 'border-slate-300 text-slate-700 hover:bg-slate-100'}`}>
+              <button onClick={(e) => { e.stopPropagation(); onOpenCompany?.(job); }} className={`px-4 py-2 text-xs font-bold rounded-lg transition-colors border flex items-center gap-1.5 ${isDarkMode ? 'border-white/10 text-slate-300 hover:bg-[#1a2636]' : 'border-slate-300 text-slate-700 hover:bg-slate-100'}`}>
                 <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
                 Open
               </button>
 
-              {applyStatus === 'error' && (
-                <span className="text-[11px] text-red-500 font-medium">Failed to submit application.</span>
+              {applyError && <span className="text-[11px] text-red-500 font-medium">{applyError}</span>}
+              {!applyError && applyState.kind === 'cooldown' && (
+                <span className={`text-[11px] ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Your previous application wasn't selected. You can apply again after {REAPPLY_COOLDOWN_DAYS} days.</span>
+              )}
+              {!applyError && applyState.kind === 'reapply' && (
+                <span className={`text-[11px] ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Your previous application wasn't selected. You're welcome to apply again.</span>
               )}
             </div>
 
@@ -182,6 +216,11 @@ export default function CandidateDashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [jobsError, setJobsError] = useState('');
   const [savedError, setSavedError] = useState('');
+  const [applications, setApplications] = useState([]);
+  const [applicationsLoading, setApplicationsLoading] = useState(false);
+  const [applicationsError, setApplicationsError] = useState('');
+  const [isApplicationsOpen, setApplicationsOpen] = useState(false);
+  const [companyJob, setCompanyJob] = useState(null);
 
   useEffect(() => { document.documentElement.classList.toggle('light-mode', !isDarkMode); }, [isDarkMode]);
 
@@ -192,6 +231,45 @@ export default function CandidateDashboard() {
       document.documentElement.classList.add('light-mode');
     }
   }, [isDarkMode]);
+
+  // Candidate application history (title, company, date applied, status).
+  const loadApplications = async (userId) => {
+    setApplicationsLoading(true);
+    setApplicationsError('');
+    try {
+      const { data, error } = await supabase
+        .from('applications')
+        .select('*, job_postings(id, title, recruiter_id)')
+        .eq('candidate_id', userId)
+        .order('applied_at', { ascending: false });
+      if (error) throw error;
+
+      // Company names live on the employers table (id = recruiter_id).
+      const recruiterIds = [...new Set((data || []).map((a) => a.job_postings?.recruiter_id).filter(Boolean))];
+      let companies = {};
+      if (recruiterIds.length) {
+        const { data: employers } = await supabase.from('employers').select('id, companyName').in('id', recruiterIds);
+        companies = Object.fromEntries((employers || []).map((e) => [e.id, e.companyName]));
+      }
+
+      setApplications((data || []).map((a) => ({
+        id: a.id,
+        jobId: a.job_id,
+        statusUpdatedAt: a.status_updated_at,
+        jobTitle: a.job_postings?.title || 'Position no longer available',
+        jobRemoved: !a.job_postings,
+        company: companies[a.job_postings?.recruiter_id] || '—',
+        appliedAt: a.applied_at,
+        status: a.status || 'Applied',
+        matchScore: a.match_score,
+      })));
+    } catch (err) {
+      console.error("Applications Error:", err);
+      setApplicationsError(err.message);
+    } finally {
+      setApplicationsLoading(false);
+    }
+  };
 
   const loadRecommendations = async (userId) => {
     try {
@@ -263,7 +341,12 @@ export default function CandidateDashboard() {
             initials: initials
           });
           
+          // Make sure a candidate_profiles row with first/last name exists, so recruiters
+          // see the real name on applications instead of "Unknown".
+          await createPublicProfile(response.data.id, response.data.email, 'job_seeker', metadata.full_name || metadata.name || '');
+
           await loadRecommendations(response.data.id);
+          await loadApplications(response.data.id);
           
           const { data: savedData } = await supabase
             .from('saved_jobs')
@@ -317,6 +400,8 @@ export default function CandidateDashboard() {
         toggleTheme={() => setIsDarkMode(!isDarkMode)}
         openProfile={() => setProfileModalOpen(true)}
         logout={handleLogout}
+        openApplications={() => { setApplicationsOpen(true); loadApplications(user.id); }}
+        applicationsCount={applications.length}
       />
       <main className="max-w-[1200px] mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-12">
         <div className="mb-8">
@@ -365,6 +450,9 @@ export default function CandidateDashboard() {
                     key={job.id} 
                     job={job} 
                     userId={user.id}
+                    application={applications.find((a) => a.jobId === job.id)}
+                    onApplied={() => loadApplications(user.id)}
+                    onOpenCompany={setCompanyJob}
                     isSaved={savedJobs.some((saved) => saved.job_posting_id === job.id)} 
                     onToggleSave={async (jobId) => {
                       const existing = savedJobs.find((saved) => saved.job_posting_id === jobId);
@@ -421,9 +509,9 @@ export default function CandidateDashboard() {
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 lg:gap-8">
           {[
-            { value: "0", label: "Active applications" },
-            { value: "0", label: "Interview requests" },
-            { value: "—", label: "Average match score" }
+            { value: String(applications.filter((a) => a.status !== 'Rejected').length), label: "Active applications" },
+            { value: String(applications.filter((a) => a.status === 'Interview').length), label: "Interview requests" },
+            { value: applications.length ? `${Math.round(applications.reduce((sum, a) => sum + (a.matchScore || 0), 0) / applications.length)}%` : "—", label: "Average match score" }
           ].map((stat, idx) => (
             <div key={idx} className={`p-6 rounded-2xl border ${isDarkMode ? 'bg-[#121b27] border-white/5' : 'bg-white border-slate-200 shadow-sm'}`}>
               <span className={`block text-4xl font-serif font-bold mb-1 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{stat.value}</span>
@@ -433,6 +521,16 @@ export default function CandidateDashboard() {
         </div>
       </main>
 
+      {companyJob && <CompanyViewModal job={companyJob} onClose={() => setCompanyJob(null)} isDarkMode={isDarkMode} />}
+      {isApplicationsOpen && (
+        <ApplicationsModal
+          applications={applications}
+          isLoading={applicationsLoading}
+          error={applicationsError}
+          onClose={() => setApplicationsOpen(false)}
+          isDarkMode={isDarkMode}
+        />
+      )}
       {isFilterModalOpen && <FilterModal onClose={() => setFilterModalOpen(false)} isDarkMode={isDarkMode} />}
       {isProfileModalOpen && (
         <ProfileModal
@@ -444,4 +542,4 @@ export default function CandidateDashboard() {
       )}
     </div>
   );
-}
+}
