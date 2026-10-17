@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getCurrentUser, logoutUser } from '../../data/services/authService';
 import { apiFetch } from '../../data/services/apiClient';
@@ -7,9 +7,21 @@ import { supabase } from '../../../supabaseClient.js';
 import { TopHeader } from '../components/TopHeader';
 import { CompanyProfileModal } from '../components/CompanyProfileModal';
 import { ProfileModal } from '../components/ProfileModal';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { JobListingItem } from '../components/JobListingItem';
+import { JOB_STATUS_FILTERS, useJobListings } from '../../hooks/useJobListings';
+import { PipelinePage } from './PipelinePage';
+import { FileUploadField } from '../components/FileUploadField';
+import { useJobAttachments } from '../../hooks/useJobAttachments';
 
 const emptyJobForm = {
   title: '', location: '', work_type: 'Remote', employment_type: 'Full-time', description: '', requirements: '',
+};
+
+// Character limits for long text fields (adjust to taste)
+const JOB_TEXT_LIMITS = {
+  description: 5000,   // roughly 700-900 words, typical for a full job post
+  requirements: 3000,  // roughly 400-500 words
 };
 
 const formatPostedDate = (createdAt) => `Posted ${new Date(createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;
@@ -58,68 +70,183 @@ function CloseButton({ onClick, isDarkMode }) {
   );
 }
 
+/* ------------------------------------------------------------------ Resizable textarea with character counter */
+function ResizableTextarea({ id, label, value, onChange, placeholder, maxLength, labelColor, inputBg, isDarkMode }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const textareaRef = useRef(null);
+
+  const length = (value || '').length;
+  const ratio = length / maxLength;
+  const mutedColor = isDarkMode ? 'text-slate-500' : 'text-slate-400';
+  const counterColor = length >= maxLength
+    ? 'text-red-500 font-bold'
+    : ratio >= 0.9
+      ? 'text-amber-500 font-semibold'
+      : mutedColor;
+
+  const toggleExpanded = () => {
+    // Clear any height set by dragging the resize handle so the toggle always takes effect
+    if (textareaRef.current) textareaRef.current.style.height = '';
+    setIsExpanded((current) => !current);
+  };
+
+  return (
+    <div className="flex flex-col gap-1.5 md:col-span-2">
+      <div className="flex items-center justify-between gap-3">
+        <label htmlFor={id} className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>{label}</label>
+        <button
+          type="button"
+          onClick={toggleExpanded}
+          aria-pressed={isExpanded}
+          aria-controls={id}
+          className="rounded-md px-2 py-1 text-xs font-bold text-[#ea6036] transition-colors hover:bg-[#ea6036]/10 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ea6036]"
+        >
+          {isExpanded ? 'Collapse' : 'Expand'}
+        </button>
+      </div>
+      <textarea
+        id={id}
+        ref={textareaRef}
+        rows={isExpanded ? 16 : 4}
+        maxLength={maxLength}
+        value={value || ''}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        className={`min-h-[104px] max-h-[60vh] resize-y rounded-xl px-4 py-3 text-sm leading-relaxed outline-none border transition-colors ${inputBg}`}
+      />
+      <div className="flex items-center justify-between text-[11px]">
+        <span className={mutedColor}>Drag the corner to resize, or use {isExpanded ? 'Collapse' : 'Expand'}.</span>
+        <span className={counterColor} role={length >= maxLength ? 'status' : undefined}>
+          {length.toLocaleString()} / {maxLength.toLocaleString()}
+          {length >= maxLength ? ' (limit reached)' : ''}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ Job form (create + edit) */
-function JobFormModal({ mode, form, setForm, onClose, onSubmit, isSubmitting, message, isDarkMode }) {
+function JobFormModal({ mode, form, setForm, jobId, recruiterId, onClose, onSubmit, isSubmitting, message, isDarkMode }) {
   const isEdit = mode === 'edit';
+  const attachmentState = useJobAttachments(jobId, recruiterId, isEdit || Boolean(jobId));
   const updateField = (field, value) => setForm((current) => ({ ...current, [field]: value }));
   const inputBg = isDarkMode ? 'bg-[#0a121c] border-white/10 text-white focus:border-[#ea6036]' : 'bg-white border-slate-300 text-slate-900 focus:border-[#ea6036] focus:ring-1 focus:ring-[#ea6036]';
   const labelColor = isDarkMode ? 'text-slate-400' : 'text-slate-600';
+  const requestClose = () => {
+    if (isSubmitting && !window.confirm('An upload is in progress. Close the form anyway? The job and any completed attachments will be kept.')) return;
+    onClose();
+  };
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') requestClose();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [isSubmitting, onClose]);
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    if (attachmentState.isLoading || attachmentState.validationErrors.length) return;
+    onSubmit(event, attachmentState);
+  };
+  const downloadAttachment = async (attachment) => {
+    const downloadWindow = window.open('about:blank', '_blank');
+    const url = await attachmentState.getDownloadUrl(attachment.file_path);
+    if (downloadWindow && url) {
+      downloadWindow.opener = null;
+      downloadWindow.location = url;
+    } else {
+      downloadWindow?.close();
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
-      <div className={`fixed inset-0 backdrop-blur-sm transition-opacity ${isDarkMode ? 'bg-[#04080e]/80' : 'bg-slate-900/30'}`} onClick={onClose}></div>
-      <form onSubmit={onSubmit} className={`relative z-10 max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl p-6 sm:p-8 shadow-2xl transition-colors ${isDarkMode ? 'bg-[#0d1622] border border-[#1b2b3b]' : 'bg-white border border-slate-200'}`}>
-        <div className="mb-6 flex items-start justify-between gap-4">
-          <div>
+      <button type="button" aria-label="Close job form" className={`fixed inset-0 backdrop-blur-sm transition-opacity ${isDarkMode ? 'bg-[#04080e]/80' : 'bg-slate-900/30'}`} onClick={requestClose} />
+      <form onSubmit={handleSubmit} className={`relative z-10 flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl shadow-2xl transition-colors ${isDarkMode ? 'border border-[#1b2b3b] bg-[#0d1622]' : 'border border-slate-200 bg-white'}`}>
+        <header className={`flex shrink-0 items-start justify-between gap-4 border-b p-6 sm:px-8 ${isDarkMode ? 'border-white/5' : 'border-slate-200'}`}>
+          <div className="min-w-0">
             <h2 className={`text-2xl font-serif font-bold ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{isEdit ? 'Edit job listing' : 'Post a new job listing'}</h2>
             <p className={`mt-1 text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{isEdit ? 'Update the details candidates see. Match scores are recalculated on save.' : 'Add the role details candidates will see.'}</p>
           </div>
-          <CloseButton onClick={onClose} isDarkMode={isDarkMode} />
+          <CloseButton onClick={requestClose} isDarkMode={isDarkMode} />
+        </header>
+        <div className="min-h-0 flex-1 overflow-y-auto p-6 sm:px-8">
+          <div className="grid gap-5 md:grid-cols-2">
+            <label className="flex flex-col gap-1.5 md:col-span-2">
+              <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Job title *</span>
+              <input required value={form.title} onChange={(e) => updateField('title', e.target.value)} placeholder="e.g. Senior Product Designer" className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`} />
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Location</span>
+              <input value={form.location || ''} onChange={(e) => updateField('location', e.target.value)} placeholder="City or region" className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`} />
+            </label>
+            <label className="flex flex-col gap-1.5">
+              <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Work type</span>
+              <select value={form.work_type} onChange={(e) => updateField('work_type', e.target.value)} className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`}>
+                <option>Remote</option><option>Hybrid</option><option>On-site</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1.5 md:col-span-2">
+              <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Employment type</span>
+              <select value={form.employment_type} onChange={(e) => updateField('employment_type', e.target.value)} className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`}>
+                <option>Full-time</option><option>Part-time</option><option>Contract</option>
+              </select>
+            </label>
+            <ResizableTextarea
+              id="job-description"
+              label="Description"
+              value={form.description}
+              onChange={(value) => updateField('description', value)}
+              placeholder="Describe the role and responsibilities"
+              maxLength={JOB_TEXT_LIMITS.description}
+              labelColor={labelColor}
+              inputBg={inputBg}
+              isDarkMode={isDarkMode}
+            />
+            <ResizableTextarea
+              id="job-requirements"
+              label="Requirements"
+              value={form.requirements}
+              onChange={(value) => updateField('requirements', value)}
+              placeholder="List the minimum qualifications and skills"
+              maxLength={JOB_TEXT_LIMITS.requirements}
+              labelColor={labelColor}
+              inputBg={inputBg}
+              isDarkMode={isDarkMode}
+            />
+            <FileUploadField
+              files={attachmentState.files}
+              attachments={attachmentState.attachments}
+              validationErrors={attachmentState.validationErrors}
+              uploadError={attachmentState.error}
+              isLoading={attachmentState.isLoading}
+              isSubmitting={isSubmitting}
+              isDarkMode={isDarkMode}
+              onAddFiles={attachmentState.addFiles}
+              onRemoveFile={attachmentState.removeFile}
+              onRemoveAttachment={async (attachment) => { await attachmentState.deleteAttachment(attachment.id); }}
+              onDownloadAttachment={downloadAttachment}
+            />
+          </div>
         </div>
-        <div className="grid gap-5 md:grid-cols-2">
-          <label className="flex flex-col gap-1.5 md:col-span-2">
-            <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Job title *</span>
-            <input required value={form.title} onChange={(e) => updateField('title', e.target.value)} placeholder="e.g. Senior Product Designer" className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`} />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Location</span>
-            <input value={form.location || ''} onChange={(e) => updateField('location', e.target.value)} placeholder="City or region" className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`} />
-          </label>
-          <label className="flex flex-col gap-1.5">
-            <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Work type</span>
-            <select value={form.work_type} onChange={(e) => updateField('work_type', e.target.value)} className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`}>
-              <option>Remote</option><option>Hybrid</option><option>On-site</option>
-            </select>
-          </label>
-          <label className="flex flex-col gap-1.5 md:col-span-2">
-            <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Employment type</span>
-            <select value={form.employment_type} onChange={(e) => updateField('employment_type', e.target.value)} className={`rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`}>
-              <option>Full-time</option><option>Part-time</option><option>Contract</option>
-            </select>
-          </label>
-          <label className="flex flex-col gap-1.5 md:col-span-2">
-            <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Description</span>
-            <textarea rows="4" value={form.description || ''} onChange={(e) => updateField('description', e.target.value)} placeholder="Describe the role and responsibilities" className={`resize-none rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`} />
-          </label>
-          <label className="flex flex-col gap-1.5 md:col-span-2">
-            <span className={`text-xs font-bold uppercase tracking-wider ${labelColor}`}>Requirements</span>
-            <textarea rows="4" value={form.requirements || ''} onChange={(e) => updateField('requirements', e.target.value)} placeholder="List the minimum qualifications and skills" className={`resize-none rounded-xl px-4 py-3 text-sm outline-none border transition-colors ${inputBg}`} />
-          </label>
-        </div>
-        {message && <p className={`mt-5 text-sm font-medium ${message.type === 'error' ? 'text-red-500' : 'text-[#4fa784]'}`}>{message.text}</p>}
-        <div className="mt-8 flex justify-end gap-3">
-          <button type="button" onClick={onClose} className={`rounded-xl border px-6 py-2.5 text-sm font-bold transition-colors ${isDarkMode ? 'border-white/10 text-slate-300 hover:bg-white/5' : 'border-slate-300 text-slate-600 hover:bg-slate-50'}`}>Cancel</button>
-          <button type="submit" disabled={isSubmitting} className="rounded-xl px-6 py-2.5 text-sm font-bold text-white bg-[#ea6036] hover:bg-[#d8552e] shadow-md transition-all disabled:cursor-not-allowed disabled:opacity-60">
-            {isSubmitting ? (isEdit ? 'Saving...' : 'Publishing...') : (isEdit ? 'Save changes' : 'Publish listing')}
+        <footer className={`flex shrink-0 justify-end gap-3 border-t p-5 sm:px-8 ${isDarkMode ? 'border-white/5' : 'border-slate-200'}`}>
+          <button type="button" onClick={requestClose} className={`rounded-xl border px-6 py-2.5 text-sm font-bold transition-colors ${isDarkMode ? 'border-white/10 text-slate-300 hover:bg-white/5' : 'border-slate-300 text-slate-600 hover:bg-slate-50'}`}>Cancel</button>
+          <button type="submit" disabled={isSubmitting || attachmentState.isLoading} className="rounded-xl px-6 py-2.5 text-sm font-bold text-white bg-[#ea6036] hover:bg-[#d8552e] shadow-md transition-all disabled:cursor-not-allowed disabled:opacity-60">
+            {isSubmitting ? <span className="inline-flex items-center gap-2"><span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />{isEdit ? 'Saving...' : 'Publishing...'}</span> : (attachmentState.isLoading ? 'Loading attachments…' : (isEdit ? 'Save changes' : 'Publish listing'))}
           </button>
-        </div>
+        </footer>
       </form>
+      {message?.type === 'error' && (
+        <div role="alert" aria-live="assertive" className={`fixed bottom-5 right-5 z-[60] max-w-md rounded-xl border px-4 py-3 text-sm font-medium shadow-xl ${isDarkMode ? 'border-red-900/50 bg-[#36191b] text-red-100' : 'border-red-200 bg-red-50 text-red-700'}`}>
+          {message.text}
+        </div>
+      )}
     </div>
   );
 }
 
 /* ------------------------------------------------------------------ Review applications modal */
-const APPLICATION_STATUSES = ['Applied', 'Interview', 'Hired', 'Rejected'];
+const APPLICATION_STATUSES = ['Applied', 'Screening', 'Interview', 'Offer', 'Hired', 'Rejected'];
 const statusLabel = (status) => (status === 'Rejected' ? 'Not selected' : status);
 
 function ReviewApplicationsModal({ job, onClose, onStatusChange, isDarkMode }) {
@@ -128,12 +255,16 @@ function ReviewApplicationsModal({ job, onClose, onStatusChange, isDarkMode }) {
   const [error, setError] = useState('');
   const [previewCandidate, setPreviewCandidate] = useState(null);
   const [savingId, setSavingId] = useState(null);
+  const [expandedApplicationId, setExpandedApplicationId] = useState(null);
 
   // Recruiter sets the outcome. "Rejected" (shown as "Not selected") lets the candidate re-apply after the cooldown.
   const updateStatus = async (app, status) => {
     setSavingId(app.id);
     setError('');
-    const { error: updateError } = await supabase.from('applications').update({ status }).eq('id', app.id);
+    const { error: updateError } = await supabase
+      .from('applications')
+      .update({ status, stage: status.toLowerCase() })
+      .eq('id', app.id);
     if (updateError) {
       setError(updateError.message);
     } else {
@@ -150,7 +281,7 @@ function ReviewApplicationsModal({ job, onClose, onStatusChange, isDarkMode }) {
       setError('');
       const { data, error: queryError } = await supabase
         .from('applications')
-        .select('id, match_score, status, applied_at, candidate_id, candidate_profiles(firstName, lastName, email)')
+        .select('id, match_score, status, applied_at, candidate_id, applicant_details, candidate_profiles(firstName, lastName, email)')
         .eq('job_id', job.id)
         .order('match_score', { ascending: false });
       if (cancelled) return;
@@ -224,7 +355,70 @@ function ReviewApplicationsModal({ job, onClose, onStatusChange, isDarkMode }) {
                         >
                           View profile
                         </button>
+                        {app.applicant_details && (
+                          <button
+                            type="button"
+                            aria-expanded={expandedApplicationId === app.id}
+                            onClick={() => setExpandedApplicationId((current) => current === app.id ? null : app.id)}
+                            className={`rounded-lg border px-3 py-1.5 text-xs font-bold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#ea6036] ${isDarkMode ? 'border-white/10 text-slate-300 hover:bg-[#1a2636]' : 'border-slate-300 text-slate-600 hover:bg-white'}`}
+                          >
+                            {expandedApplicationId === app.id ? 'Hide application' : 'View application'}
+                          </button>
+                        )}
                       </div>
+                      {expandedApplicationId === app.id && app.applicant_details && (
+                        <section className={`basis-full rounded-xl border p-4 text-xs ${isDarkMode ? 'border-white/10 bg-[#0a121c] text-slate-300' : 'border-slate-200 bg-white text-slate-700'}`} aria-label={`Application details for ${person.name}`}>
+                          <div className="grid gap-4 sm:grid-cols-2">
+                            <div>
+                              <h3 className="mb-2 font-bold">Personal profile</h3>
+                              <dl className="space-y-1">
+                                {[
+                                  ['Name', app.applicant_details.fullName],
+                                  ['Email', app.applicant_details.email],
+                                  ['Phone', app.applicant_details.phone],
+                                  ['Location', app.applicant_details.location],
+                                  ['Profile link', app.applicant_details.profileUrl],
+                                  ['Summary', app.applicant_details.summary],
+                                  ['Years of experience', app.applicant_details.yearsExperience],
+                                  ['Cover note', app.applicant_details.coverNote],
+                                ].filter(([, value]) => value).map(([label, value]) => (
+                                  <div key={label}><dt className="inline font-semibold">{label}: </dt><dd className="inline whitespace-pre-line break-words">{String(value)}</dd></div>
+                                ))}
+                              </dl>
+                            </div>
+                            <div className="space-y-3">
+                              <div>
+                                <h3 className="mb-1 font-bold">Education</h3>
+                                {(app.applicant_details.education || []).length ? (
+                                  <ul className="space-y-1">
+                                    {app.applicant_details.education.map((item, index) => <li key={index}>{[item.degreeLevel, item.fieldOfStudy, item.school, item.yearGraduated].filter(Boolean).join(' · ')}</li>)}
+                                  </ul>
+                                ) : <p className={muted}>Not provided</p>}
+                              </div>
+                              <div>
+                                <h3 className="mb-1 font-bold">Qualifications</h3>
+                                {(app.applicant_details.qualifications || []).length ? (
+                                  <ul className="space-y-1">
+                                    {app.applicant_details.qualifications.map((item, index) => <li key={index}>{[item.name, item.organization, item.yearObtained].filter(Boolean).join(' · ')}</li>)}
+                                  </ul>
+                                ) : <p className={muted}>Not provided</p>}
+                              </div>
+                              <div>
+                                <h3 className="mb-1 font-bold">Skills</h3>
+                                <p>{(app.applicant_details.skills || []).join(', ') || 'Not provided'}</p>
+                              </div>
+                              <div>
+                                <h3 className="mb-1 font-bold">Languages</h3>
+                                {(app.applicant_details.languages || []).length ? (
+                                  <ul className="space-y-1">
+                                    {app.applicant_details.languages.map((item, index) => <li key={index}>{[item.language, item.proficiency].filter(Boolean).join(' · ')}</li>)}
+                                  </ul>
+                                ) : <p className={muted}>Not provided</p>}
+                              </div>
+                            </div>
+                          </div>
+                        </section>
+                      )}
                     </li>
                   );
                 })}
@@ -246,56 +440,15 @@ function ReviewApplicationsModal({ job, onClose, onStatusChange, isDarkMode }) {
   );
 }
 
-/* ------------------------------------------------------------------ Job listings container */
-function JobListings({ jobs, applicants, onEdit, onReview, onDelete, isDarkMode }) {
-  const getApplicantCount = (jobId) => applicantCountFor(applicants, jobId);
-  const getTopMatch = (jobId) => topMatchFor(applicants, jobId);
-  const actionBtn = `rounded-xl border px-4 py-2 text-xs font-bold transition-colors ${isDarkMode ? 'border-white/10 text-slate-300 hover:bg-[#1a2636]' : 'border-slate-200 text-slate-600 hover:bg-slate-100'}`;
-
-  return (
-    <div className={`rounded-2xl p-6 border transition-colors ${isDarkMode ? 'bg-[#121b27] border-white/5' : 'bg-white border-slate-200 shadow-sm'}`}>
-      <h2 className={`mb-4 text-lg font-serif ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>All listings ({jobs.length})</h2>
-      {jobs.length === 0 ? (
-        <p className={`py-8 text-center text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>No listings yet. Post a job from the Dashboard with “+ Post new job”.</p>
-      ) : (
-        <div className="flex flex-col">
-          {jobs.map((job) => (
-            <div key={job.id} className={`flex flex-wrap items-center justify-between gap-5 border-b py-5 last:border-0 ${isDarkMode ? 'border-white/5' : 'border-slate-100'}`}>
-              <div className="min-w-0">
-                <div className={`flex items-center gap-3 text-base font-bold ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>
-                  {job.title}
-                  <Badge positive isDarkMode={isDarkMode}>{job.status || 'active'}</Badge>
-                </div>
-                <div className={`mt-1.5 text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                  {job.location || 'Location not specified'} - {job.work_type || 'Work type not specified'} - {job.employment_type || 'Employment type not specified'} - {formatPostedDate(job.created_at)}
-                </div>
-              </div>
-              <div className="flex items-center gap-6">
-                <div className="text-center">
-                  <div className={`text-xl font-bold ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{getApplicantCount(job.id)}</div>
-                  <div className={`text-[10px] uppercase tracking-wider ${isDarkMode ? 'text-slate-500' : 'text-slate-400'}`}>applicants</div>
-                </div>
-                <div className="text-center">
-                  <div className={`text-xl font-bold ${isDarkMode ? 'text-[#4fa784]' : 'text-emerald-600'}`}>{getTopMatch(job.id)}</div>
-                  <div className={`text-[10px] uppercase tracking-wider ${isDarkMode ? 'text-slate-500' : 'text-slate-400'}`}>top match</div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button onClick={() => onReview(job)} className={actionBtn}>Review</button>
-                  <button onClick={() => onEdit(job)} className={actionBtn}>Edit</button>
-                  <button onClick={() => onDelete(job)} className={`rounded-xl border px-4 py-2 text-xs font-bold transition-colors ${isDarkMode ? 'border-red-900/50 text-red-400 hover:bg-red-900/20' : 'border-red-200 text-red-600 hover:bg-red-50'}`}>Delete</button>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 /* ------------------------------------------------------------------ Shared: save a job (create or edit) */
 const saveJob = async ({ mode, jobId, form }) => {
   if (!form.title.trim()) return { success: false, message: 'Job title is required.' };
+  if ((form.description || '').length > JOB_TEXT_LIMITS.description) {
+    return { success: false, message: `Description must be ${JOB_TEXT_LIMITS.description.toLocaleString()} characters or fewer.` };
+  }
+  if ((form.requirements || '').length > JOB_TEXT_LIMITS.requirements) {
+    return { success: false, message: `Requirements must be ${JOB_TEXT_LIMITS.requirements.toLocaleString()} characters or fewer.` };
+  }
   return apiFetch(mode === 'edit' ? `/api/jobs/${jobId}` : '/api/post-job', {
     method: mode === 'edit' ? 'PUT' : 'POST',
     body: JSON.stringify(form),
@@ -331,7 +484,7 @@ function JobListingsPreview({ jobs, applicants, onManage, isDarkMode }) {
               <div className="min-w-0">
                 <div className={`flex items-center gap-2 truncate text-sm font-bold ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>
                   {job.title}
-                  <Badge positive isDarkMode={isDarkMode}>{job.status || 'active'}</Badge>
+                  <Badge positive={job.hiring_status !== 'closed'} isDarkMode={isDarkMode}>{job.hiring_status === 'closed' ? 'closed' : 'open'}</Badge>
                 </div>
                 <div className={`mt-1 text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{formatPostedDate(job.created_at)} - {job.work_type || 'Work type not specified'}</div>
               </div>
@@ -357,35 +510,53 @@ function JobListingsPreview({ jobs, applicants, onManage, isDarkMode }) {
 }
 
 /* ------------------------------------------------------------------ Dashboard home */
-function Home({ isDarkMode, jobs, setJobs, applicants, onNavigate }) {
+function Home({ userId, isDarkMode, jobs, setJobs, applicants, onNavigate }) {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [form, setForm] = useState(emptyJobForm);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [message, setMessage] = useState(null);
+  const [pendingJobId, setPendingJobId] = useState(null);
 
   const stats = [
-    [jobs.filter((j) => (j.status || 'active') === 'active').length, 'Active listings'],
+    [jobs.filter((j) => !j.is_archived && (j.hiring_status || 'open') === 'open').length, 'Active listings'],
     [applicants.length, 'Total applicants'],
     [applicants.filter((a) => a.status === 'Applied' || a.status === 'Pending').length, 'Awaiting review'],
     [applicants.filter((a) => a.status === 'Interview').length, 'Interviews scheduled'],
   ];
   const recentActivity = [...applicants].sort((a, b) => new Date(b.applied_at) - new Date(a.applied_at)).slice(0, 5);
 
-  const openCreate = () => { setForm(emptyJobForm); setMessage(null); setIsFormOpen(true); };
-  const closeForm = () => { if (!isSubmitting) setIsFormOpen(false); };
+  const openCreate = () => { setForm(emptyJobForm); setMessage(null); setPendingJobId(null); setIsFormOpen(true); };
+  const closeForm = () => { setIsFormOpen(false); };
 
-  const handleSubmit = async (event) => {
-    event.preventDefault();
+  const handleSubmit = async (_event, attachmentState) => {
     setIsSubmitting(true);
     setMessage(null);
-    const result = await saveJob({ mode: 'create', form });
-    if (!result.success) {
-      setMessage({ type: 'error', text: result.message || 'Something went wrong. Please try again.' });
-    } else {
-      setJobs((current) => [result.data, ...current]);
+    try {
+      let targetJobId = pendingJobId;
+      if (!targetJobId) {
+        const result = await saveJob({ mode: 'create', form });
+        if (!result.success) {
+          setMessage({ type: 'error', text: result.message || 'Something went wrong. Please try again.' });
+          return false;
+        }
+        targetJobId = result.data.id;
+        setPendingJobId(targetJobId);
+        setJobs((current) => [result.data, ...current]);
+      }
+
+      if (attachmentState.files.some((entry) => entry.status !== 'uploaded')) {
+        const uploadResult = await attachmentState.uploadAttachments(targetJobId, attachmentState.files);
+        if (!uploadResult.success) {
+          setMessage({ type: 'error', text: uploadResult.error || attachmentState.error || 'Some attachments failed to upload. Retry the failed files.' });
+          return false;
+        }
+      }
       setIsFormOpen(false);
+      setPendingJobId(null);
+      return true;
+    } finally {
+      setIsSubmitting(false);
     }
-    setIsSubmitting(false);
   };
 
   return (
@@ -429,19 +600,34 @@ function Home({ isDarkMode, jobs, setJobs, applicants, onNavigate }) {
       </div>
 
       {isFormOpen && (
-        <JobFormModal mode="create" form={form} setForm={setForm} onClose={closeForm} onSubmit={handleSubmit} isSubmitting={isSubmitting} message={message} isDarkMode={isDarkMode} />
+        <JobFormModal mode="create" form={form} setForm={setForm} jobId={pendingJobId} recruiterId={userId} onClose={closeForm} onSubmit={handleSubmit} isSubmitting={isSubmitting} message={message} isDarkMode={isDarkMode} />
       )}
     </section>
   );
 }
 
 /* ------------------------------------------------------------------ Job Listings page: review, edit, delete */
-function JobsPage({ user, isDarkMode, jobs, setJobs, applicants, setApplicants }) {
+function JobsPage({ user, isDarkMode, setJobs, applicants, setApplicants }) {
   const [editingJob, setEditingJob] = useState(null);
   const [form, setForm] = useState(emptyJobForm);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [message, setMessage] = useState(null);
   const [reviewJob, setReviewJob] = useState(null);
+  const [jobToArchive, setJobToArchive] = useState(null);
+  const [isArchiving, setIsArchiving] = useState(false);
+  const {
+    jobs: visibleJobs,
+    statusFilter,
+    setStatusFilter,
+    isLoading,
+    error,
+    clearError,
+    pendingJobIds,
+    archiveJob,
+    restoreJob,
+    toggleHiring,
+    reload,
+  } = useJobListings({ setDashboardJobs: setJobs });
 
   const openEdit = (job) => {
     setForm({
@@ -451,27 +637,45 @@ function JobsPage({ user, isDarkMode, jobs, setJobs, applicants, setApplicants }
     setMessage(null);
     setEditingJob(job);
   };
-  const closeForm = () => { if (!isSubmitting) setEditingJob(null); };
+  const closeForm = () => { setEditingJob(null); };
 
-  const handleSubmit = async (event) => {
-    event.preventDefault();
+  const handleSubmit = async (_event, attachmentState) => {
     setIsSubmitting(true);
     setMessage(null);
-    const result = await saveJob({ mode: 'edit', jobId: editingJob.id, form });
-    if (!result.success) {
-      setMessage({ type: 'error', text: result.message || 'Something went wrong. Please try again.' });
-    } else {
+    try {
+      const result = await saveJob({ mode: 'edit', jobId: editingJob.id, form });
+      if (!result.success) {
+        setMessage({ type: 'error', text: result.message || 'Something went wrong. Please try again.' });
+        return false;
+      }
       setJobs((current) => current.map((job) => (job.id === editingJob.id ? result.data : job)));
+
+      if (attachmentState.files.some((entry) => entry.status !== 'uploaded')) {
+        const uploadResult = await attachmentState.uploadAttachments(editingJob.id, attachmentState.files);
+        if (!uploadResult.success) {
+          setMessage({ type: 'error', text: uploadResult.error || attachmentState.error || 'Some attachments failed to upload. Retry the failed files.' });
+          return false;
+        }
+      }
+
+      await reload();
       setEditingJob(null);
+      return true;
+    } finally {
+      setIsSubmitting(false);
     }
-    setIsSubmitting(false);
   };
 
-  const handleDelete = async (job) => {
-    if (!window.confirm("Delete this listing? This can't be undone")) return;
-    const { error } = await supabase.from('job_postings').delete().eq('id', job.id).eq('recruiter_id', user.id);
-    if (error) setMessage({ type: 'error', text: error.message });
-    else setJobs((current) => current.filter((item) => item.id !== job.id));
+  const handleArchive = async () => {
+    if (!jobToArchive) return;
+    setIsArchiving(true);
+    await archiveJob(jobToArchive.id);
+    setIsArchiving(false);
+    setJobToArchive(null);
+  };
+
+  const handleRestore = async (job) => {
+    await restoreJob(job.id);
   };
 
   const handleStatusChange = (applicationId, status) => {
@@ -483,34 +687,82 @@ function JobsPage({ user, isDarkMode, jobs, setJobs, applicants, setApplicants }
       <div className="mb-8">
         <div className={`mb-1 text-sm font-semibold ${isDarkMode ? 'text-[#4fa784]' : 'text-emerald-600'}`}>Job Listings</div>
         <h1 className={`text-3xl sm:text-4xl font-serif mb-2 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Manage your listings</h1>
-        <p className={`text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Review applicants for each role, update the details, or remove listings you no longer need.</p>
+        <p className={`text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Review applicants, manage hiring status, and archive listings you no longer need.</p>
       </div>
 
       {message && !editingJob && <p className="mb-5 text-sm font-medium text-red-500">{message.text}</p>}
 
-      <JobListings jobs={jobs} applicants={applicants} onEdit={openEdit} onReview={setReviewJob} onDelete={handleDelete} isDarkMode={isDarkMode} />
+      {error && (
+        <div role="alert" className={`fixed bottom-5 right-5 z-40 flex max-w-md items-center justify-between gap-4 rounded-xl border px-4 py-3 text-sm shadow-xl ${isDarkMode ? 'border-red-900/50 bg-[#36191b] text-red-100' : 'border-red-200 bg-red-50 text-red-700'}`}>
+          <span>{error}</span>
+          <button type="button" aria-label="Dismiss error" onClick={clearError} className="rounded px-2 py-1 font-bold focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-500">×</button>
+        </div>
+      )}
+
+      <div className={`rounded-2xl border p-6 transition-colors ${isDarkMode ? 'border-white/5 bg-[#121b27]' : 'border-slate-200 bg-white shadow-sm'}`}>
+        <div className="mb-5 flex flex-wrap items-center justify-between gap-4">
+          <h2 className={`text-lg font-serif ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>All listings ({visibleJobs.length})</h2>
+          <div className={`inline-flex flex-wrap gap-1 rounded-xl p-1 ${isDarkMode ? 'bg-[#0a121c]' : 'bg-slate-100'}`} role="group" aria-label="Filter job listings">
+            {JOB_STATUS_FILTERS.map((filter) => (
+              <button
+                key={filter.value}
+                type="button"
+                aria-pressed={statusFilter === filter.value}
+                onClick={() => setStatusFilter(filter.value)}
+                className={`rounded-lg px-3 py-2 text-xs font-bold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ea6036] ${statusFilter === filter.value ? 'bg-[#ea6036] text-white shadow-sm' : (isDarkMode ? 'text-slate-400 hover:text-white' : 'text-slate-600 hover:text-slate-900')}`}
+              >
+                {filter.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        {isLoading ? (
+          <p role="status" className={`py-8 text-center text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Loading listings…</p>
+        ) : error ? (
+          <div className={`py-8 text-center text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+            <p>Listings could not be loaded.</p>
+            <button type="button" onClick={reload} className="mt-2 font-bold text-[#ea6036] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#ea6036]">Try again</button>
+          </div>
+        ) : visibleJobs.length === 0 ? (
+          <p className={`py-8 text-center text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>No listings in this view.</p>
+        ) : (
+          <div className="flex flex-col">
+            {visibleJobs.map((job) => (
+              <JobListingItem
+                key={job.id}
+                job={job}
+                applicantCount={applicantCountFor(applicants, job.id)}
+                topMatch={topMatchFor(applicants, job.id)}
+                isDarkMode={isDarkMode}
+                isPending={pendingJobIds.includes(job.id)}
+                onReview={setReviewJob}
+                onEdit={openEdit}
+                onArchive={setJobToArchive}
+                onRestore={handleRestore}
+                onToggleHiring={toggleHiring}
+              />
+            ))}
+          </div>
+        )}
+      </div>
 
       {editingJob && (
-        <JobFormModal mode="edit" form={form} setForm={setForm} onClose={closeForm} onSubmit={handleSubmit} isSubmitting={isSubmitting} message={message} isDarkMode={isDarkMode} />
+        <JobFormModal mode="edit" form={form} setForm={setForm} jobId={editingJob.id} recruiterId={user.id} onClose={closeForm} onSubmit={handleSubmit} isSubmitting={isSubmitting} message={message} isDarkMode={isDarkMode} />
+      )}
+      {jobToArchive && (
+        <ConfirmDialog
+          title="Confirm archive"
+          message="Archive this listing? It will be hidden from candidates but you can restore it anytime. Applicants and data are kept."
+          confirmLabel="Archive"
+          isDarkMode={isDarkMode}
+          isWorking={isArchiving}
+          onConfirm={handleArchive}
+          onCancel={() => { if (!isArchiving) setJobToArchive(null); }}
+        />
       )}
       {reviewJob && (
         <ReviewApplicationsModal job={reviewJob} onClose={() => setReviewJob(null)} onStatusChange={handleStatusChange} isDarkMode={isDarkMode} />
       )}
-    </section>
-  );
-}
-
-function SimpleView({ eyebrow, title, description, isDarkMode }) {
-  return (
-    <section>
-      <div className="mb-8">
-        <div className={`mb-1 text-sm font-semibold ${isDarkMode ? 'text-[#4fa784]' : 'text-emerald-600'}`}>{eyebrow}</div>
-        <h1 className={`text-3xl sm:text-4xl font-serif mb-2 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{title}</h1>
-        <p className={`text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{description}</p>
-      </div>
-      <div className={`rounded-2xl p-10 text-center border ${isDarkMode ? 'bg-[#121b27] border-white/5' : 'bg-white border-slate-200 shadow-sm'}`}>
-        <p className={`text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>This workspace view is ready for Supabase data wiring.</p>
-      </div>
     </section>
   );
 }
@@ -557,6 +809,7 @@ export default function RecruiterDashboard() {
       .from('job_postings')
       .select('*')
       .eq('recruiter_id', userId)
+      .eq('is_archived', false)
       .order('created_at', { ascending: false });
     if (fetchedJobs) setJobs(fetchedJobs);
 
@@ -590,10 +843,10 @@ export default function RecruiterDashboard() {
   }
 
   const content = view === 'pipeline'
-    ? <SimpleView eyebrow="Pipeline Management" title="Hiring pipeline" description="Track candidates as they move through your hiring process." isDarkMode={isDarkMode} />
+    ? <PipelinePage user={user} isDarkMode={isDarkMode} />
     : view === 'jobs'
-      ? <JobsPage user={user} isDarkMode={isDarkMode} jobs={jobs} setJobs={setJobs} applicants={applicants} setApplicants={setApplicants} />
-      : <Home isDarkMode={isDarkMode} jobs={jobs} setJobs={setJobs} applicants={applicants} onNavigate={setView} />;
+      ? <JobsPage user={user} isDarkMode={isDarkMode} setJobs={setJobs} applicants={applicants} setApplicants={setApplicants} />
+      : <Home userId={user.id} isDarkMode={isDarkMode} jobs={jobs} setJobs={setJobs} applicants={applicants} onNavigate={setView} />;
 
   return (
     <div className={`min-h-screen font-sans selection:bg-[#ea6036]/30 transition-colors duration-200 ${isDarkMode ? 'bg-[#090e15] text-slate-200' : 'bg-slate-50 text-slate-700'}`}>

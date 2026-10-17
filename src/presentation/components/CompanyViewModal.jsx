@@ -23,9 +23,11 @@ export const CompanyViewModal = ({ job, onClose, isDarkMode }) => {
         const [{ data: employer }, { data: jobs }] = await Promise.all([
           supabase.from('employers').select('*').eq('id', recruiterId).maybeSingle(),
           supabase.from('job_postings')
-            .select('id, title, location, work_type, employment_type, status, created_at')
+            .select('id, title, location, work_type, employment_type, status, hiring_status, is_archived, created_at')
             .eq('recruiter_id', recruiterId)
             .neq('id', job.id)
+            .eq('is_archived', false)
+            .eq('hiring_status', 'open')
             .order('created_at', { ascending: false }),
         ]);
         if (!cancelled) {

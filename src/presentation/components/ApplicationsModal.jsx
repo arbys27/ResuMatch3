@@ -33,7 +33,7 @@ export const ApplicationsModal = ({ applications, isLoading, error, onClose, isD
               {[0, 1, 2].map((i) => <div key={i} className={`h-12 animate-pulse rounded-xl ${isDarkMode ? 'bg-[#121b27]' : 'bg-slate-100'}`} />)}
             </div>
           ) : applications.length === 0 ? (
-            <p className={`py-10 text-center text-sm ${muted}`}>You haven't applied to any positions yet. Use “One-click apply” on a recommended job to get started.</p>
+            <p className={`py-10 text-center text-sm ${muted}`}>You haven't applied to any positions yet. Choose Apply on a job listing to get started.</p>
           ) : (
             <table className="w-full min-w-[560px] text-left">
               <thead>

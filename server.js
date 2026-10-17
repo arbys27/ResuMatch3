@@ -58,6 +58,7 @@ const requireRecruiter = (req, res, next) => {
 };
 
 const JOB_FIELDS = ['title', 'location', 'work_type', 'employment_type', 'description', 'requirements'];
+const HIRING_STATUSES = ['open', 'closed'];
 
 const pickJobFields = (body) => {
   const job = {};
@@ -106,6 +107,10 @@ app.post('/api/post-job', requireUser, requireRecruiter, async (req, res) => {
         ...job,
         recruiter_id: req.user.id, // taken from the verified token, not the request body
         status: 'active',
+        hiring_status: 'open',
+        is_archived: false,
+        archived_at: null,
+        closed_at: null,
         job_embedding: vectorArray
       }])
       .select()
@@ -119,6 +124,74 @@ app.post('/api/post-job', requireUser, requireRecruiter, async (req, res) => {
     console.error("Job Posting Error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
+});
+
+// Recruiters can filter their own listings; archived jobs are excluded by default.
+app.get('/api/jobs', requireUser, requireRecruiter, async (req, res) => {
+  const status = req.query.status || 'all';
+  if (!['open', 'closed', 'archived', 'all'].includes(status)) {
+    return res.status(400).json({ success: false, message: 'Status must be open, closed, archived, or all.' });
+  }
+
+  try {
+    let query = supabase
+      .from('job_postings')
+      .select('*')
+      .eq('recruiter_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    if (status === 'open') query = query.eq('is_archived', false).eq('hiring_status', 'open');
+    if (status === 'closed') query = query.eq('is_archived', false).eq('hiring_status', 'closed');
+    if (status === 'archived') query = query.eq('is_archived', true);
+    if (status === 'all') query = query.eq('is_archived', false);
+
+    const { data, error } = await query;
+    if (error) throw new Error(`Database query failed: ${error.message}`);
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error('Job List Error:', error);
+    res.status(500).json({ success: false, message: 'Unable to load job listings.' });
+  }
+});
+
+const updateOwnedJob = async (req, res, updates, operation, requireUnarchived = false) => {
+  try {
+    let query = supabase
+      .from('job_postings')
+      .update(updates)
+      .eq('id', req.params.id)
+      .eq('recruiter_id', req.user.id);
+    if (requireUnarchived) query = query.eq('is_archived', false);
+    const { data, error } = await query.select().maybeSingle();
+
+    if (error) throw new Error(error.message);
+    if (!data) return res.status(404).json({ success: false, message: 'Job listing not found or it must be restored first.' });
+    return res.json({ success: true, data });
+  } catch (error) {
+    console.error(`${operation} Error:`, error);
+    return res.status(500).json({ success: false, message: `Unable to ${operation.toLowerCase()} this listing.` });
+  }
+};
+
+app.patch('/api/jobs/:id/archive', requireUser, requireRecruiter, async (req, res) => {
+  return updateOwnedJob(req, res, { is_archived: true, archived_at: new Date().toISOString() }, 'Archive Job');
+});
+
+app.patch('/api/jobs/:id/restore', requireUser, requireRecruiter, async (req, res) => {
+  return updateOwnedJob(req, res, { is_archived: false, archived_at: null }, 'Restore Job');
+});
+
+app.patch('/api/jobs/:id/hiring-status', requireUser, requireRecruiter, async (req, res) => {
+  const { hiringStatus } = req.body || {};
+  if (!HIRING_STATUSES.includes(hiringStatus)) {
+    return res.status(400).json({ success: false, message: 'Hiring status must be open or closed.' });
+  }
+
+  const updates = {
+    hiring_status: hiringStatus,
+    closed_at: hiringStatus === 'closed' ? new Date().toISOString() : null,
+  };
+  return updateOwnedJob(req, res, updates, 'Update Hiring Status', true);
 });
 
 // Edit an existing job listing. Only the recruiter who owns it can update it.
