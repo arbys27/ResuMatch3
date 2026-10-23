@@ -81,6 +81,7 @@ async function fetchJobs(candidateId, jobId) {
     nursingEvidence = getCandidateNursingEvidence(profile);
     matchById = new Map((recommendations || []).map((job) => [job.id, {
       match: Math.round(Number(job.similarity || 0) * 100),
+      semanticSimilarity: Number(job.similarity),
       matchedKeywords: job.matched_keywords || job.matchedKeywords || null,
     }]));
   }
@@ -101,6 +102,7 @@ async function fetchJobs(candidateId, jobId) {
     return {
       ...job,
       company_name: companies.get(job.recruiter_id) || 'Company name not provided',
+      semanticSimilarity: recommended?.semanticSimilarity ?? null,
       // A 65% semantic similarity is not a 65% qualification match.
       // Show 0 for clearly unrelated nursing roles; show no score if the
       // candidate has no parsed information to make that determination.
